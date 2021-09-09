@@ -3,3 +3,4 @@ obj-y += rga/
 obj-y += rkcif/
 obj-y += rkcsi/
 obj-y += rkisp1/
+obj-y += iep/
