@@ -486,6 +486,18 @@ config CHARGER_88PM860X
 	help
 	  Say Y here to enable charger for Marvell 88PM860x chip.
 
+config PHOTONICAT_POWER
+	tristate "Photonicat PMU power supply driver"
+	depends on MFD_PHOTONICAT_PMU || COMPILE_TEST
+	help
+	  Photonicat PMU supports battery and charger power supply.
+	  The MCU only provides voltage meter.
+
+	  Say Y here to enable support for Photonicat PMU power supply.
+
+	  This driver can also be built as a module. If so, the module will be
+	  called photonicat-supply.
+
 config BATTERY_RX51
 	tristate "Nokia RX-51 (N900) battery driver"
 	depends on TWL4030_MADC
