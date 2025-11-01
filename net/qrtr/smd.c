@@ -5,6 +5,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/skbuff.h>
 #include <linux/rpmsg.h>
 #include <linux/soc/qcom/qrtr.h>
@@ -15,6 +16,9 @@ struct qrtr_smd_dev {
 	struct qrtr_endpoint ep;
 	struct rpmsg_endpoint *channel;
 	struct device *dev;
+
+	/* Protect against channel open/close while sending */
+	struct mutex send_lock;
 };
 
 struct qrtr_new_server {
@@ -212,11 +216,8 @@ static int qcom_smd_qrtr_device_unregister(struct device *dev, void *data)
 static int qcom_smd_qrtr_callback(struct rpmsg_device *rpdev,
 				  void *data, int len, void *priv, u32 addr)
 {
-	struct qrtr_smd_dev *qsdev = dev_get_drvdata(&rpdev->dev);
+	struct qrtr_smd_dev *qsdev = priv;
 	int rc;
-
-	if (!qsdev)
-		return -EAGAIN;
 
 	rc = qrtr_endpoint_post(&qsdev->ep, data, len);
 	if (rc == -EINVAL) {
@@ -238,7 +239,12 @@ static int qcom_smd_qrtr_send(struct qrtr_endpoint *ep, struct sk_buff *skb)
 	if (rc)
 		goto out;
 
-	rc = rpmsg_send(qsdev->channel, skb->data, skb->len);
+	scoped_guard(mutex, &qsdev->send_lock) {
+		if (qsdev->channel)
+			rc = rpmsg_send(qsdev->channel, skb->data, skb->len);
+		else
+			rc = -ENODEV;
+	}
 
 out:
 	if (rc)
@@ -257,15 +263,27 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 	if (!qsdev)
 		return -ENOMEM;
 
-	qsdev->channel = rpdev->ept;
 	qsdev->dev = &rpdev->dev;
 	qsdev->ep.xmit = qcom_smd_qrtr_send;
 	qsdev->ep.add_device = qcom_smd_qrtr_add_device;
 	qsdev->ep.del_device = qcom_smd_qrtr_del_device;
 
+	rc = devm_mutex_init(&rpdev->dev, &qsdev->send_lock);
+	if (rc)
+		return rc;
+
+	/* Block sending until we have fully opened the channel */
+	guard(mutex)(&qsdev->send_lock);
+
 	rc = qrtr_endpoint_register(&qsdev->ep, QRTR_EP_NID_AUTO);
 	if (rc)
 		return rc;
+
+	qsdev->channel = rpmsg_dev_open_ept(rpdev, qcom_smd_qrtr_callback, qsdev);
+	if (!qsdev->channel) {
+		qrtr_endpoint_unregister(&qsdev->ep);
+		return -EREMOTEIO;
+	}
 
 	dev_set_drvdata(&rpdev->dev, qsdev);
 
@@ -277,12 +295,18 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 static void qcom_smd_qrtr_remove(struct rpmsg_device *rpdev)
 {
 	struct qrtr_smd_dev *qsdev = dev_get_drvdata(&rpdev->dev);
+	struct rpmsg_endpoint *ept;
 
 	device_for_each_child(qsdev->dev, NULL, qcom_smd_qrtr_device_unregister);
 
-	qrtr_endpoint_unregister(&qsdev->ep);
+	/* We are about to close the channel, so stop all sending now */
+	scoped_guard(mutex, &qsdev->send_lock) {
+		ept = qsdev->channel;
+		qsdev->channel = NULL;
+	}
 
-	dev_set_drvdata(&rpdev->dev, NULL);
+	rpmsg_destroy_ept(ept);
+	qrtr_endpoint_unregister(&qsdev->ep);
 }
 
 static const struct rpmsg_device_id qcom_smd_qrtr_smd_match[] = {
@@ -293,7 +317,6 @@ static const struct rpmsg_device_id qcom_smd_qrtr_smd_match[] = {
 static struct rpmsg_driver qcom_smd_qrtr_driver = {
 	.probe = qcom_smd_qrtr_probe,
 	.remove = qcom_smd_qrtr_remove,
-	.callback = qcom_smd_qrtr_callback,
 	.id_table = qcom_smd_qrtr_smd_match,
 	.drv = {
 		.name = "qcom_smd_qrtr",
